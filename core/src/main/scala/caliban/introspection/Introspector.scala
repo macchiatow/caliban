@@ -1,10 +1,15 @@
 package caliban.introspection
 
+import caliban.CalibanError.ExecutionError
 import caliban.introspection.adt._
 import caliban.parsing.adt.Definition.ExecutableDefinition.OperationDefinition
 import caliban.parsing.adt.Document
 import caliban.parsing.adt.Selection.Field
 import caliban.schema.{ Operation, RootSchema, RootType, Schema, Types }
+import caliban.wrappers.Wrapper.IntrospectionWrapper
+import zio.ZIO
+
+import scala.annotation.tailrec
 
 object Introspector {
 
@@ -32,7 +37,21 @@ object Introspector {
   /**
    * Generates a schema for introspecting the given type.
    */
-  def introspect(rootType: RootType): RootSchema[Any] = {
+  def introspect[R](
+    rootType: RootType,
+    introWrappers: List[IntrospectionWrapper[R]] = Nil
+  ): ZIO[R, ExecutionError, RootSchema[Any]] = {
+
+    @tailrec
+    def wrap(
+      query: ZIO[R, ExecutionError, __Introspection]
+    )(wrappers: List[IntrospectionWrapper[R]]): ZIO[R, ExecutionError, __Introspection] =
+      wrappers match {
+        case Nil             => query
+        case wrapper :: tail => wrap(wrapper.f(query))(tail)
+      }
+
+    val introspectionSchema = Schema.gen[__Introspection]
     val types               = rootType.types.updated("Boolean", Types.boolean).values.toList.sortBy(_.name.getOrElse(""))
     val resolver            = __Introspection(
       __Schema(
@@ -44,8 +63,15 @@ object Introspector {
       ),
       args => types.find(_.name.contains(args.name)).get
     )
-    val introspectionSchema = Schema.gen[__Introspection]
-    RootSchema(Operation(introspectionSchema.toType_(), introspectionSchema.resolve(resolver)), None, None)
+
+    for {
+      wrappedInto <- wrap(ZIO.succeed(resolver))(introWrappers)
+      rootSchema   = RootSchema(
+                       Operation(introspectionSchema.toType_(), introspectionSchema.resolve(wrappedInto)),
+                       None,
+                       None
+                     )
+    } yield rootSchema
   }
 
   private[caliban] def isIntrospection(document: Document): Boolean =
